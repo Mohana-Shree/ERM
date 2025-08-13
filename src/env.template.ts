@@ -1,0 +1,10 @@
+// Copy this file to .env and fill in your Supabase credentials
+// VITE_SUPABASE_URL=your_supabase_project_url_here
+// VITE_SUPABASE_ANON_KEY=your_supabase_anon_key_here
+
+export const envTemplate = {
+  supabase: {
+    url: 'your_supabase_project_url_here',
+    anonKey: 'your_supabase_anon_key_here'
+  }
+};
