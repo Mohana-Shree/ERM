@@ -1,150 +1,122 @@
-import { supabase } from '../lib/supabaseClient';
+// Frontend auth service that calls backend API only
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000';
+
 import type { User } from '../types';
 
-export async function signUpWithEmail({ 
-  email, 
-  password, 
-  name 
-}: { 
-  email: string; 
-  password: string; 
-  name: string; 
+// Helper function to make API calls
+async function apiCall(endpoint: string, options: RequestInit = {}) {
+  const url = `${API_BASE_URL}${endpoint}`;
+  
+  const defaultHeaders: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+
+  // Add auth token if it exists in localStorage
+  const token = localStorage.getItem('supabase_token');
+  if (token) {
+    defaultHeaders['Authorization'] = `Bearer ${token}`;
+  }
+
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      ...defaultHeaders,
+      ...options.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: 'Network error' }));
+    throw new Error(error.error || `HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
+export async function signUpWithEmail({
+  email,
+  password,
+  name
+}: {
+  email: string;
+  password: string;
+  name: string;
 }) {
   console.log('signUpWithEmail called with:', { email, name });
   
-  try {
-    const { data: signUpData, error } = await supabase.auth.signUp({ 
-      email, 
-      password, 
-      options: { data: { name } } 
-    });
-    
-    console.log('Supabase signup response:', { data: !!signUpData, error: !!error });
-    
-    if (error) {
-      console.error('Supabase signup error:', error);
-      throw error;
-    }
-    
-    if (!signUpData.user) {
-      throw new Error('No user data returned from signup');
-    }
-    
-    // Ensure a profile row exists in `users` with id matching auth.uid
-    const userId = signUpData.user.id;
-    console.log('Creating user profile for ID:', userId);
-    
-    try {
-      const { error: profileError } = await supabase.from('users').upsert({ 
-        id: userId, 
-        email, 
-        name, 
-        role: 'user' 
-      }, { onConflict: 'id' });
-      
-      if (profileError) {
-        console.error('Error creating user profile:', profileError);
-        // Don't throw here, as the auth user was created successfully
-      } else {
-        console.log('User profile created successfully');
-      }
-    } catch (profileError) {
-      console.error('Exception creating user profile:', profileError);
-      // Don't throw here, as the auth user was created successfully
-    }
-    
-    console.log('Signup completed successfully');
-    
-    // Don't auto sign-in - let the user manually sign in
-    // This ensures they go to the login page first
-    console.log('User account created, no auto sign-in');
-    
-    return signUpData;
-  } catch (error) {
-    console.error('signUpWithEmail error:', error);
-    throw error;
-  }
+  const response = await apiCall('/auth/signup', {
+    method: 'POST',
+    body: JSON.stringify({ email, password, name }),
+  });
+
+  console.log('Backend signup response:', response);
+  return response;
 }
 
-export async function signInWithEmail({ 
-  email, 
-  password 
-}: { 
-  email: string; 
-  password: string; 
+export async function signInWithEmail({
+  email,
+  password
+}: {
+  email: string;
+  password: string;
 }) {
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error) throw error;
-  return data;
+  console.log('signInWithEmail called with:', { email });
+  
+  const response = await apiCall('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  });
+
+  console.log('Backend login response:', response);
+
+  // Store the token from the session
+  if (response.session?.access_token) {
+    localStorage.setItem('supabase_token', response.session.access_token);
+  }
+
+  return {
+    user: response.user,
+    session: response.session,
+  };
 }
 
 export async function getSession() {
-  const { data } = await supabase.auth.getSession();
-  return data.session ?? null;
+  try {
+    const response = await apiCall('/auth/session');
+    return response.session;
+  } catch (error) {
+    console.error('Error getting session:', error);
+    // Clear invalid token
+    localStorage.removeItem('supabase_token');
+    return null;
+  }
 }
 
 export async function signOut() {
-  await supabase.auth.signOut();
+  try {
+    await apiCall('/auth/logout', {
+      method: 'POST',
+    });
+  } catch (error) {
+    console.error('Error signing out:', error);
+  } finally {
+    // Always clear local token
+    localStorage.removeItem('supabase_token');
+  }
 }
 
 export async function getCurrentUser(): Promise<User | null> {
   try {
     console.log('getCurrentUser called');
     
-    const { data: { user }, error: authError } = await supabase.auth.getUser();
-    if (authError) {
-      console.error('Error getting auth user:', authError);
-      return null;
-    }
+    const response = await apiCall('/auth/me');
+    console.log('Backend user response:', response);
     
-    if (!user) {
-      console.log('No auth user found');
-      return null;
-    }
-    
-    console.log('Auth user found, ID:', user.id);
-    
-    // Try to get user profile from database
-    const { data, error } = await supabase
-      .from('users')
-      .select('*')
-      .eq('id', user.id)
-      .single();
-    
-    if (error) {
-      console.error('Error fetching user profile:', error);
-      
-      // If profile doesn't exist, try to create it
-      if (error.code === 'PGRST116') { // No rows returned
-        console.log('User profile not found, attempting to create...');
-        
-        const { data: newProfile, error: createError } = await supabase
-          .from('users')
-          .insert({
-            id: user.id,
-            email: user.email,
-            name: user.user_metadata?.name || 'Unknown',
-            role: 'user'
-          })
-          .select()
-          .single();
-        
-        if (createError) {
-          console.error('Error creating user profile:', createError);
-          return null;
-        }
-        
-        console.log('User profile created successfully:', newProfile);
-        return newProfile;
-      }
-      
-      throw error;
-    }
-    
-    console.log('User profile fetched successfully:', data);
-    return data;
+    return response.user;
   } catch (error) {
     console.error('getCurrentUser error:', error);
+    // Clear invalid token
+    localStorage.removeItem('supabase_token');
     return null;
   }
 }

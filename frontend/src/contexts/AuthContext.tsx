@@ -1,11 +1,9 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import type { Session } from '@supabase/supabase-js';
 import { getSession, getCurrentUser, signOut as authSignOut } from '../services/auth';
-import { supabase } from '../lib/supabaseClient';
 import type { User } from '../types';
 
 interface AuthContextType {
-  session: Session | null;
+  session: any | null;
   user: User | null;
   loading: boolean;
   signOut: () => Promise<void>;
@@ -14,24 +12,33 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [session, setSession] = useState<Session | null>(null);
+  const [session, setSession] = useState<any | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let timeoutId: NodeJS.Timeout;
-    
+
     const initializeAuth = async () => {
       try {
         console.log('Initializing auth...');
         
-        // Get initial session
-        const session = await getSession();
-        console.log('Initial session:', !!session);
-        
-        setSession(session);
-        
-        if (session?.user) {
+        // Check if we have a stored token
+        const token = localStorage.getItem('supabase_token');
+        if (!token) {
+          console.log('No stored token found');
+          setSession(null);
+          setUser(null);
+          setLoading(false);
+          return;
+        }
+
+        // Get session from backend
+        const sessionData = await getSession();
+        console.log('Initial session:', !!sessionData);
+        setSession(sessionData);
+
+        if (sessionData) {
           try {
             const userData = await getCurrentUser();
             console.log('User data fetched:', !!userData);
@@ -39,6 +46,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           } catch (error) {
             console.error('Error fetching initial user data:', error);
             setUser(null);
+            setSession(null);
+            // Clear invalid token
+            localStorage.removeItem('supabase_token');
           }
         } else {
           setUser(null);
@@ -46,6 +56,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       } catch (error) {
         console.error('Error initializing auth:', error);
         setUser(null);
+        setSession(null);
+        // Clear invalid token
+        localStorage.removeItem('supabase_token');
       } finally {
         setLoading(false);
       }
@@ -57,37 +70,32 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         console.warn('Auth loading timeout - forcing loading to false');
         setLoading(false);
       }
-    }, 5000); // Reduced to 5 seconds
+    }, 5000);
 
     // Initialize auth
     initializeAuth();
 
-    // Listen for auth changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      async (_event, session) => {
-        console.log('Auth state changed:', _event, !!session);
-        setSession(session);
-        
-        if (session?.user) {
-          try {
-            const userData = await getCurrentUser();
-            setUser(userData);
-          } catch (error) {
-            console.error('Error fetching user data:', error);
-            setUser(null);
-          }
+    // Listen for storage changes (token updates from other tabs)
+    const handleStorageChange = (event: StorageEvent) => {
+      if (event.key === 'supabase_token') {
+        if (event.newValue) {
+          // Token was added/updated, reinitialize
+          initializeAuth();
         } else {
+          // Token was removed, clear state
+          setSession(null);
           setUser(null);
         }
-        setLoading(false);
       }
-    );
+    };
+
+    window.addEventListener('storage', handleStorageChange);
 
     return () => {
-      subscription?.unsubscribe();
       clearTimeout(timeoutId);
+      window.removeEventListener('storage', handleStorageChange);
     };
-  }, []); // Remove loading dependency to prevent infinite loops
+  }, []);
 
   const signOut = async () => {
     try {
@@ -96,6 +104,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(null);
     } catch (error) {
       console.error('Error signing out:', error);
+      // Force clear state even if backend call fails
+      setSession(null);
+      setUser(null);
     }
   };
 
