@@ -1,8 +1,20 @@
-import { Router } from 'express';
+import { Router, Request } from 'express';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { supabaseAdmin, supabaseAnon } from '../supabase';
 
+// Extend Express Request type to include userId
+declare module 'express-serve-static-core' {
+  interface Request {
+    userId?: string;
+  }
+}
+
 const router = Router();
+
+const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key';
+const JWT_EXPIRES_IN: string | number = process.env.JWT_EXPIRES_IN || '7d';
 
 // Validation schemas
 const SignupSchema = z.object({
@@ -15,6 +27,27 @@ const LoginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(6)
 });
+
+const generateToken = (userId: string) => {
+  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN as string | number });
+};
+
+export const authenticateToken = (req: any, res: any, next: any) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err: any, decoded: any) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    req.userId = decoded.userId;
+    next();
+  });
+};
 
 // Signup endpoint - uses Supabase Auth
 router.post('/signup', async (req, res) => {
@@ -29,47 +62,46 @@ router.post('/signup', async (req, res) => {
 
     const { email, password, name } = parse.data;
 
+    const { data: existingUser } = await supabaseAdmin
+      .from('users')
+      .select('id')
+      .eq('email', email)
+      .single();
+    
+    if (existingUser) {
+      return res.status(400).json({ error: 'User with this email already exists' });
+    }
+
+    const saltRounds = 12;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    
     // Create user with Supabase Auth
-    const { data: signUpData, error } = await supabaseAnon.auth.signUp({
-      email,
-      password,
-      options: { 
-        data: { name } // Store name in user metadata
-      }
-    });
-
-    if (error) {
-      console.error('Supabase signup error:', error);
-      return res.status(400).json({ error: error.message });
-    }
-
-    if (!signUpData.user) {
-      return res.status(500).json({ error: 'No user data returned from signup' });
-    }
+    
 
     // Create user profile in users table
-    const userId = signUpData.user.id;
-    const { error: profileError } = await supabaseAdmin
+    const userId = crypto.randomUUID();
+    const { data: user, error } = await supabaseAdmin
       .from('users')
-      .upsert({
+      .insert({
         id: userId,
         email,
         name,
-        role: 'user',
+        password_hash: hashedPassword,
+        role: 'user', // You can implement email verification later
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
-      }, { 
-        onConflict: 'id' 
-      });
+      })
+      .select('id, email, name, role, created_at')
+      .single();
 
-    if (profileError) {
-      console.error('Profile creation error:', profileError);
-      // Don't return error here as auth user was created successfully
+    if (error) {
+      console.error('User creation error:', error);
+      return res.status(500).json({ error: 'Failed to create user' });
     }
 
     return res.status(201).json({ 
-      message: 'Account created successfully! Please sign in with your new credentials.',
-      user: signUpData.user
+      message: 'Account created successfully!',
+      user
     });
 
   } catch (error) {
@@ -89,65 +121,31 @@ router.post('/login', async (req, res) => {
     const { email, password } = parse.data;
 
     // Sign in with Supabase
-    const { data, error } = await supabaseAnon.auth.signInWithPassword({ 
-      email, 
-      password 
-    });
-
-    if (error) {
-      console.error('Login error:', error);
-      return res.status(401).json({ error: error.message });
-    }
-
-    const { session, user } = data;
-    if (!session || !user) {
-      return res.status(401).json({ error: 'No session created' });
-    }
-
-    // Get user profile from database
-    const { data: profile, error: profileError } = await supabaseAdmin
+    const { data: user, error } = await supabaseAdmin
       .from('users')
-      .select('id, email, name, role, phone, avatar_url')
-      .eq('id', user.id)
+      .select('id, email, name, password_hash, role, phone, avatar_url')
+      .eq('email', email)
       .single();
 
-    if (profileError) {
-      console.error('Profile fetch error:', profileError);
-      // If profile doesn't exist, create it
-      if (profileError.code === 'PGRST116') {
-        const { data: newProfile, error: createError } = await supabaseAdmin
-          .from('users')
-          .insert({
-            id: user.id,
-            email: user.email,
-            name: user.user_metadata?.name || 'Unknown',
-            role: 'user',
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          })
-          .select('id, email, name, role, phone, avatar_url')
-          .single();
-
-        if (createError) {
-          console.error('Error creating profile:', createError);
-          return res.status(500).json({ error: 'Failed to create user profile' });
-        }
-
-        return res.json({
-          message: 'Login successful',
-          session,
-          user: newProfile
-        });
-      }
-      return res.status(500).json({ error: 'Failed to fetch user profile' });
+    if (error || !user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
     }
+    
+    const isPasswordValid = await bcrypt.compare(password, user.password_hash);
+    if (!isPasswordValid) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const token = generateToken(user.id);
+
+    const { password_hash: _, ...userWithoutPassword } = user;
 
     return res.json({
       message: 'Login successful',
-      session,
-      user: profile
+      user: userWithoutPassword,
+      token,
+      expiresIn: JWT_EXPIRES_IN
     });
-
   } catch (error) {
     console.error('Login error:', error);
     return res.status(500).json({ error: 'Internal server error' });
@@ -155,36 +153,21 @@ router.post('/login', async (req, res) => {
 });
 
 // Get current user endpoint - verifies Supabase JWT
-router.get('/me', async (req, res) => {
+router.get('/me',authenticateToken, async (req :any, res) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'No token provided' });
-    }
-
-    const token = authHeader.substring(7); // Remove 'Bearer ' prefix
-
-    // Verify token with Supabase
-    const { data: { user }, error } = await supabaseAnon.auth.getUser(token);
-
-    if (error || !user) {
-      console.error('Token verification error:', error);
-      return res.status(401).json({ error: 'Invalid or expired token' });
-    }
-
     // Get fresh user profile from database
-    const { data: profile, error: profileError } = await supabaseAdmin
+    const { data: profile, error } = await supabaseAdmin
       .from('users')
       .select('id, email, name, role, phone, avatar_url, created_at, updated_at')
-      .eq('id', user.id)
+      .eq('id', req.userId)
       .single();
 
-    if (profileError) {
-      console.error('Profile fetch error:', profileError);
-      return res.status(500).json({ error: 'Failed to fetch user profile' });
+    if (error) {
+      console.error('User fetch error:', error);
+      return res.status(404).json({ error: 'User not found' });
     }
 
-    return res.json({ user: profile });
+    return res.json({user:profile});
 
   } catch (error) {
     console.error('Get user error:', error);
@@ -193,33 +176,26 @@ router.get('/me', async (req, res) => {
 });
 
 // Get session endpoint
-router.get('/session', async (req, res) => {
+router.get('/session',authenticateToken, async (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.json({ session: null });
-    }
-
-    const token = authHeader.substring(7);
-
-    // Verify token with Supabase
-    const { data: { user }, error } = await supabaseAnon.auth.getUser(token);
-
-    if (error || !user) {
-      return res.json({ session: null });
-    }
-
-    // Get user profile
-    const { data: profile } = await supabaseAdmin
+    // Get user profile using JWT userId
+    const { data: profile, error } = await supabaseAdmin
       .from('users')
-      .select('id, email, name, role, phone, avatar_url')
-      .eq('id', user.id)
+      .select('id, email, name, role, phone, avatar_url') 
+      .eq('id', req.userId)
       .single();
+
+    if (error) {
+      return res.status(404).json({ session: null });
+    }
+
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.split(' ')[1];
 
     return res.json({ 
       session: {
         access_token: token,
-        user: profile || user
+        user: profile
       }
     });
 
@@ -232,16 +208,10 @@ router.get('/session', async (req, res) => {
 // Logout endpoint (client-side token removal)
 router.post('/logout', async (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const token = authHeader.substring(7);
-      // Verify token to get user ID
-      const { data: { user }, error: getUserError } = await supabaseAnon.auth.getUser(token);
-      if (user) {
-        // Optional: You can call Supabase signOut to invalidate the session
-        const { error } = await supabaseAdmin.auth.admin.signOut(user.id);
-      }
-    }
+    // In JWT, logout is primarily handled client-side by removing the token
+    // You could implement a token blacklist here if needed for extra security
+    console.log(`User ${req.userId} logged out`);
+    
     return res.json({ message: 'Logged out successfully' });
   } catch (error) {
     console.error('Logout error:', error);
